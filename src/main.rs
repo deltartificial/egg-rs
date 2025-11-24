@@ -319,7 +319,7 @@ fn sample_logits(logits: &[i8], rng: &mut u32) -> usize {
 fn sample_model(model: &EggModel, seed_text: &[u8], seed_len: usize, gen_len: usize) {
     let mut logits = vec![0i8; VOCAB_SIZE];
     let mut state = RecurrentState::default();
-    let mut rng = 12345u32;
+    let mut rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
     print!("\x1b[32m");
     let mut input_token = 0u8;
     let actual_seed_len = seed_len.min(seed_text.len());
@@ -355,15 +355,13 @@ fn init_model() -> EggModel {
     for i in 0..(HIDDEN_DIM * VOCAB_SIZE) { head[i] = gen_noise_val(&mut rng); }
 
     let mut gru_weights = vec![vec![vec![0i8; HIDDEN_DIM * HIDDEN_DIM]; 4]; N_LAYERS];
+    let gru_biases = vec![vec![vec![0i8; HIDDEN_DIM]; 2]; N_LAYERS];
+    let mut mlp_weights = vec![vec![vec![0i8; HIDDEN_DIM * (HIDDEN_DIM * 4)]; 2]; N_LAYERS];
+
     for l in 0..N_LAYERS {
         for g in 0..4 {
             for i in 0..(HIDDEN_DIM * HIDDEN_DIM) { gru_weights[l][g][i] = gen_noise_val(&mut rng); }
         }
-    }
-
-    let gru_biases = vec![vec![vec![0i8; HIDDEN_DIM]; 2]; N_LAYERS];
-    let mut mlp_weights = vec![vec![vec![0i8; HIDDEN_DIM * (HIDDEN_DIM * 4)]; 2]; N_LAYERS];
-    for l in 0..N_LAYERS {
         for m in 0..2 {
             for i in 0..(HIDDEN_DIM * (HIDDEN_DIM * 4)) { mlp_weights[l][m][i] = gen_noise_val(&mut rng); }
         }
