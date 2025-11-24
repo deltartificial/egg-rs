@@ -51,8 +51,7 @@ def main():
             ["script", "-q", "/dev/null", binary],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            cwd=work_dir,
-            text=True
+            cwd=work_dir
         )
 
         output_lines = []
@@ -65,16 +64,16 @@ def main():
             while time.time() - start_time < BENCH_DURATION:
                 ready, _, _ = select.select([process.stdout], [], [], 0.1)
                 if ready:
-                    line = process.stdout.readline()
-                    if not line:
+                    chunk = process.stdout.read(4096)
+                    if not chunk:
                         break
-                    output_lines.append(line)
-                    if "Training Done" in line:
+                    output_lines.append(chunk.decode('utf-8', errors='ignore'))
+                    if b"Training Done" in chunk:
                         break
                 if process.poll() is not None:
                     remaining = process.stdout.read()
                     if remaining:
-                        output_lines.append(remaining)
+                        output_lines.append(remaining.decode('utf-8', errors='ignore'))
                     break
 
             process.terminate()
@@ -85,8 +84,9 @@ def main():
         except:
             process.kill()
 
-        output = "".join(output_lines)
-        output = output.replace('\r', '\n')
+        raw = "".join(output_lines)
+        lines = re.findall(r'Step \d+/\d+ \| Loss: [\d.]+(?: \| Tok/s: [\d.]+)?', raw)
+        output = "\n".join(lines)
 
     finally:
         if copied and os.path.exists(dest_input):

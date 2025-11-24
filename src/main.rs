@@ -74,16 +74,30 @@ fn xorshift32(state: &mut u32) -> u32 {
 }
 
 #[inline(always)]
-fn gen_noise_val(rng: &mut u32) -> i8 {
-    let r = xorshift32(rng);
-    let sign = if r & 1 != 0 { 1 } else { -1 };
-    sign * ((r >> 1) & 31) as i8
-}
-
-#[inline(always)]
 fn gen_noise_vector_neon(rng: &mut u32, out: &mut [i8]) {
-    for val in out.iter_mut() {
-        *val = gen_noise_val(rng);
+    let len = out.len();
+    let mut i = 0;
+
+    while i + 16 <= len {
+        unsafe {
+            let mut vals = [0i8; 16];
+            for j in 0..16 {
+                let r = xorshift32(rng);
+                let sign = if r & 1 != 0 { 1 } else { -1 };
+                vals[j] = sign * ((r >> 1) & 31) as i8;
+            }
+
+            let vec = vld1q_s8(vals.as_ptr());
+            vst1q_s8(out.as_mut_ptr().add(i), vec);
+        }
+        i += 16;
+    }
+
+    while i < len {
+        let r = xorshift32(rng);
+        let sign = if r & 1 != 0 { 1 } else { -1 };
+        out[i] = sign * ((r >> 1) & 31) as i8;
+        i += 1;
     }
 }
 
@@ -112,14 +126,12 @@ unsafe fn dot_product_neon(a: &[i8], b: &[i8]) -> i32 {
 }
 
 #[inline(always)]
-fn matmul_perturbed(input: &[i8], weights: &[i8], output: &mut [i8], rows: usize, cols: usize, layer_seed: u32, noise_sign: i32, shift: i32) {
-    let mut a_vec = vec![0i8; rows];
-    let mut b_vec = vec![0i8; cols];
+fn matmul_perturbed(input: &[i8], weights: &[i8], output: &mut [i8], rows: usize, cols: usize, layer_seed: u32, noise_sign: i32, shift: i32, a_vec: &mut [i8], b_vec: &mut [i8]) {
     let mut rng = layer_seed;
-    gen_noise_vector_neon(&mut rng, &mut a_vec);
-    gen_noise_vector_neon(&mut rng, &mut b_vec);
+    gen_noise_vector_neon(&mut rng, &mut a_vec[..rows]);
+    gen_noise_vector_neon(&mut rng, &mut b_vec[..cols]);
 
-    let xb = unsafe { dot_product_neon(&input[..cols.min(input.len())], &b_vec) };
+    let xb = unsafe { dot_product_neon(&input[..cols.min(input.len())], &b_vec[..cols]) };
 
     for r in 0..rows {
         let w_row = &weights[r * cols..(r + 1) * cols];
@@ -168,6 +180,11 @@ fn forward_pass(model: &EggModel, inputs: &[u8], targets: Option<&[u8]>, seq_len
     let mut buf1 = vec![0i8; HIDDEN_DIM * 4];
     let mut buf2 = vec![0i8; HIDDEN_DIM];
     let mut x_temp = vec![0i8; HIDDEN_DIM];
+    let mut ft = vec![0i8; HIDDEN_DIM];
+    let mut gated_past = vec![0i8; HIDDEN_DIM];
+    let mut ht = vec![0i8; HIDDEN_DIM];
+    let mut a_noise = vec![0i8; HIDDEN_DIM * 4];
+    let mut b_noise = vec![0i8; HIDDEN_DIM * 4];
     let mut accumulated_loss = 0i32;
 
     for t in 0..seq_len {
@@ -181,23 +198,20 @@ fn forward_pass(model: &EggModel, inputs: &[u8], targets: Option<&[u8]>, seq_len
             egg_ln(&x, &model.ln_weights[l][0], &mut x_temp);
             x[..HIDDEN_DIM].copy_from_slice(&x_temp[..HIDDEN_DIM]);
 
-            matmul_perturbed(&x, &model.gru_weights[l][0], &mut buf1[..HIDDEN_DIM], HIDDEN_DIM, HIDDEN_DIM, l_seed + 1, noise_sign, 8);
-            matmul_perturbed(&rnn_state.h[l], &model.gru_weights[l][1], &mut buf2, HIDDEN_DIM, HIDDEN_DIM, l_seed + 2, noise_sign, 8);
+            matmul_perturbed(&x, &model.gru_weights[l][0], &mut buf1[..HIDDEN_DIM], HIDDEN_DIM, HIDDEN_DIM, l_seed + 1, noise_sign, 8, &mut a_noise, &mut b_noise);
+            matmul_perturbed(&rnn_state.h[l], &model.gru_weights[l][1], &mut buf2, HIDDEN_DIM, HIDDEN_DIM, l_seed + 2, noise_sign, 8, &mut a_noise, &mut b_noise);
 
-            let mut ft = vec![0i8; HIDDEN_DIM];
             for i in 0..HIDDEN_DIM {
                 ft[i] = clipped_add(clipped_add(buf1[i] as i32, buf2[i] as i32) as i32, model.gru_biases[l][0][i] as i32);
             }
 
-            let mut gated_past = vec![0i8; HIDDEN_DIM];
             for i in 0..HIDDEN_DIM {
                 gated_past[i] = (((ft[i] as i32 + 127) * rnn_state.h[l][i] as i32) >> 8) as i8;
             }
 
-            matmul_perturbed(&x, &model.gru_weights[l][2], &mut buf1[..HIDDEN_DIM], HIDDEN_DIM, HIDDEN_DIM, l_seed + 3, noise_sign, 8);
-            matmul_perturbed(&gated_past, &model.gru_weights[l][3], &mut buf2, HIDDEN_DIM, HIDDEN_DIM, l_seed + 4, noise_sign, 8);
+            matmul_perturbed(&x, &model.gru_weights[l][2], &mut buf1[..HIDDEN_DIM], HIDDEN_DIM, HIDDEN_DIM, l_seed + 3, noise_sign, 8, &mut a_noise, &mut b_noise);
+            matmul_perturbed(&gated_past, &model.gru_weights[l][3], &mut buf2, HIDDEN_DIM, HIDDEN_DIM, l_seed + 4, noise_sign, 8, &mut a_noise, &mut b_noise);
 
-            let mut ht = vec![0i8; HIDDEN_DIM];
             for i in 0..HIDDEN_DIM {
                 ht[i] = clipped_add(clipped_add(buf1[i] as i32, buf2[i] as i32) as i32, model.gru_biases[l][1][i] as i32);
             }
@@ -216,8 +230,8 @@ fn forward_pass(model: &EggModel, inputs: &[u8], targets: Option<&[u8]>, seq_len
             egg_ln(&x, &model.ln_weights[l][1], &mut x_temp);
             x[..HIDDEN_DIM].copy_from_slice(&x_temp[..HIDDEN_DIM]);
 
-            matmul_perturbed(&x, &model.mlp_weights[l][0], &mut buf1, HIDDEN_DIM * 4, HIDDEN_DIM, l_seed + 5, noise_sign, 8);
-            matmul_perturbed(&buf1, &model.mlp_weights[l][1], &mut x, HIDDEN_DIM, HIDDEN_DIM * 4, l_seed + 6, noise_sign, 9);
+            matmul_perturbed(&x, &model.mlp_weights[l][0], &mut buf1, HIDDEN_DIM * 4, HIDDEN_DIM, l_seed + 5, noise_sign, 8, &mut a_noise, &mut b_noise);
+            matmul_perturbed(&buf1, &model.mlp_weights[l][1], &mut x, HIDDEN_DIM, HIDDEN_DIM * 4, l_seed + 6, noise_sign, 9, &mut a_noise, &mut b_noise);
 
             for i in 0..HIDDEN_DIM {
                 x[i] = clipped_add(x[i] as i32, residual[i] as i32);
@@ -226,7 +240,7 @@ fn forward_pass(model: &EggModel, inputs: &[u8], targets: Option<&[u8]>, seq_len
 
         egg_ln(&x, &model.ln_out, &mut x_temp);
         x[..HIDDEN_DIM].copy_from_slice(&x_temp[..HIDDEN_DIM]);
-        matmul_perturbed(&x, &model.head, logits_out, VOCAB_SIZE, HIDDEN_DIM, step_seed + 999, noise_sign, 8);
+        matmul_perturbed(&x, &model.head, logits_out, VOCAB_SIZE, HIDDEN_DIM, step_seed + 999, noise_sign, 8, &mut a_noise, &mut b_noise);
 
         if let Some(tgt) = targets {
             accumulated_loss += compute_loss(logits_out, tgt[t]);
@@ -351,8 +365,8 @@ fn init_model() -> EggModel {
     let mut rng = 42u32;
     let mut embedding = vec![0i8; VOCAB_SIZE * HIDDEN_DIM];
     let mut head = vec![0i8; HIDDEN_DIM * VOCAB_SIZE];
-    for i in 0..(VOCAB_SIZE * HIDDEN_DIM) { embedding[i] = gen_noise_val(&mut rng); }
-    for i in 0..(HIDDEN_DIM * VOCAB_SIZE) { head[i] = gen_noise_val(&mut rng); }
+    gen_noise_vector_neon(&mut rng, &mut embedding);
+    gen_noise_vector_neon(&mut rng, &mut head);
 
     let mut gru_weights = vec![vec![vec![0i8; HIDDEN_DIM * HIDDEN_DIM]; 4]; N_LAYERS];
     let gru_biases = vec![vec![vec![0i8; HIDDEN_DIM]; 2]; N_LAYERS];
@@ -360,10 +374,10 @@ fn init_model() -> EggModel {
 
     for l in 0..N_LAYERS {
         for g in 0..4 {
-            for i in 0..(HIDDEN_DIM * HIDDEN_DIM) { gru_weights[l][g][i] = gen_noise_val(&mut rng); }
+            gen_noise_vector_neon(&mut rng, &mut gru_weights[l][g]);
         }
         for m in 0..2 {
-            for i in 0..(HIDDEN_DIM * (HIDDEN_DIM * 4)) { mlp_weights[l][m][i] = gen_noise_val(&mut rng); }
+            gen_noise_vector_neon(&mut rng, &mut mlp_weights[l][m]);
         }
     }
 
@@ -419,15 +433,15 @@ fn main() {
         pair_fitnesses.copy_from_slice(&fitnesses);
 
         for l in 0..N_LAYERS {
-            let l_seed = step_seed + (l as u32 * 100);
-            update_matrix(&mut model.gru_weights[l][0], HIDDEN_DIM, HIDDEN_DIM, l_seed + 1, &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.gru_weights[l][1], HIDDEN_DIM, HIDDEN_DIM, l_seed + 2, &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.gru_weights[l][2], HIDDEN_DIM, HIDDEN_DIM, l_seed + 3, &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.gru_weights[l][3], HIDDEN_DIM, HIDDEN_DIM, l_seed + 4, &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.mlp_weights[l][0], HIDDEN_DIM * 4, HIDDEN_DIM, l_seed + 5, &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.mlp_weights[l][1], HIDDEN_DIM, HIDDEN_DIM * 4, l_seed + 6, &pair_fitnesses, POPULATION_SIZE);
+            let l_seed = step_seed.wrapping_add((l as u32).wrapping_mul(100));
+            update_matrix(&mut model.gru_weights[l][0], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(1), &pair_fitnesses, POPULATION_SIZE);
+            update_matrix(&mut model.gru_weights[l][1], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(2), &pair_fitnesses, POPULATION_SIZE);
+            update_matrix(&mut model.gru_weights[l][2], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(3), &pair_fitnesses, POPULATION_SIZE);
+            update_matrix(&mut model.gru_weights[l][3], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(4), &pair_fitnesses, POPULATION_SIZE);
+            update_matrix(&mut model.mlp_weights[l][0], HIDDEN_DIM * 4, HIDDEN_DIM, l_seed.wrapping_add(5), &pair_fitnesses, POPULATION_SIZE);
+            update_matrix(&mut model.mlp_weights[l][1], HIDDEN_DIM, HIDDEN_DIM * 4, l_seed.wrapping_add(6), &pair_fitnesses, POPULATION_SIZE);
         }
-        update_matrix(&mut model.head, VOCAB_SIZE, HIDDEN_DIM, step_seed + 999, &pair_fitnesses, POPULATION_SIZE);
+        update_matrix(&mut model.head, VOCAB_SIZE, HIDDEN_DIM, step_seed.wrapping_add(999), &pair_fitnesses, POPULATION_SIZE);
         total_tokens += SEQ_LEN;
     }
     println!("Training Done.");

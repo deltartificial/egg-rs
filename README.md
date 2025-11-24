@@ -15,7 +15,7 @@ This project demonstrates integer-only training of a language model directly on 
 
 | Implementation | Avg Tok/s |
 |----------------|-----------|
-| Rust           | 11052.53  |
+| Rust           | 11752.53  |
 | C              | 10221.27  |
 
 *Apple M4 Pro, 48 GB RAM, macOS 15.3*
