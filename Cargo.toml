@@ -1,6 +1,18 @@
 [package]
 name = "egg-rs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+rayon = "1.10"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
