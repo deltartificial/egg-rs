@@ -280,30 +280,61 @@ fn compute_loss(logits: &[i8], target: u8) -> i32 {
     log2_fixed(sum_exp) - (logits[target as usize] as i32 + 128)
 }
 
-fn update_matrix(weights: &mut [i8], rows: usize, cols: usize, seed: u32, fitnesses: &[i32], pop_size: usize) {
+/// Preallocated buffers for update_matrix
+#[repr(C, align(64))]
+struct UpdateBuffers {
+    a_t: [[i8; MAX_POP_PAIRS]; MAX_MATRIX_DIM],
+    b_t: [[i8; MAX_POP_PAIRS]; MAX_MATRIX_DIM],
+    a_temp: [i8; MAX_MATRIX_DIM],
+    b_temp: [i8; MAX_MATRIX_DIM],
+}
+
+impl UpdateBuffers {
+    fn new() -> Self {
+        Self {
+            a_t: [[0; MAX_POP_PAIRS]; MAX_MATRIX_DIM],
+            b_t: [[0; MAX_POP_PAIRS]; MAX_MATRIX_DIM],
+            a_temp: [0; MAX_MATRIX_DIM],
+            b_temp: [0; MAX_MATRIX_DIM],
+        }
+    }
+}
+
+/// Dot product for exactly 16 elements (pairs dimension)
+#[inline(always)]
+unsafe fn dot_product_16(a: &[i8], b: &[i8]) -> i32 {
+    let a_vec = vld1q_s8(a.as_ptr());
+    let b_vec = vld1q_s8(b.as_ptr());
+    let mul_low = vmull_s8(vget_low_s8(a_vec), vget_low_s8(b_vec));
+    let mul_high = vmull_s8(vget_high_s8(a_vec), vget_high_s8(b_vec));
+    let acc = vpadalq_s16(vdupq_n_s32(0), mul_low);
+    let acc = vpadalq_s16(acc, mul_high);
+    vaddvq_s32(acc)
+}
+
+fn update_matrix_with_buf(weights: &mut [i8], rows: usize, cols: usize, seed: u32, fitnesses: &[i32], pop_size: usize, buf: &mut UpdateBuffers) {
     let pairs = (pop_size / 2).min(MAX_POP_PAIRS);
-    let mut a_t = vec![vec![0i8; MAX_POP_PAIRS]; rows.min(MAX_MATRIX_DIM)];
-    let mut b_t = vec![vec![0i8; MAX_POP_PAIRS]; cols.min(MAX_MATRIX_DIM)];
 
     for p in 0..pairs {
         let f = fitnesses[p];
         let mut rng = seed + p as u32;
-        let mut a_temp = vec![0i8; rows];
-        let mut b_temp = vec![0i8; cols];
-        gen_noise_vector_neon(&mut rng, &mut a_temp);
-        gen_noise_vector_neon(&mut rng, &mut b_temp);
+        gen_noise_vector_neon(&mut rng, &mut buf.a_temp[..rows]);
+        gen_noise_vector_neon(&mut rng, &mut buf.b_temp[..cols]);
 
         if f != 0 {
-            for r in 0..rows { a_t[r][p] = (a_temp[r] as i32 * f) as i8; }
-            for c in 0..cols { b_t[c][p] = b_temp[c]; }
+            for r in 0..rows { buf.a_t[r][p] = (buf.a_temp[r] as i32 * f) as i8; }
+            for c in 0..cols { buf.b_t[c][p] = buf.b_temp[c]; }
+        } else {
+            for r in 0..rows { buf.a_t[r][p] = 0; }
+            for c in 0..cols { buf.b_t[c][p] = 0; }
         }
     }
 
     for r in 0..rows {
         let w_row = &mut weights[r * cols..(r + 1) * cols];
-        let a_ptr = &a_t[r][..pairs];
+        let a_ptr = &buf.a_t[r][..pairs];
         for c in 0..cols {
-            let vote = unsafe { dot_product_neon(a_ptr, &b_t[c][..pairs]) };
+            let vote = unsafe { dot_product_16(a_ptr, &buf.b_t[c]) };
             if vote > UPDATE_THRESHOLD && w_row[c] < MAX_VAL { w_row[c] += 1; }
             else if vote < -UPDATE_THRESHOLD && w_row[c] > MIN_VAL { w_row[c] -= 1; }
         }
@@ -311,7 +342,7 @@ fn update_matrix(weights: &mut [i8], rows: usize, cols: usize, seed: u32, fitnes
 }
 
 fn sample_logits(logits: &[i8], rng: &mut u32) -> usize {
-    let mut probs = vec![0i32; VOCAB_SIZE];
+    let mut probs = [0i32; VOCAB_SIZE];
     let mut sum = 0i32;
     unsafe {
         for i in 0..VOCAB_SIZE {
@@ -401,6 +432,7 @@ fn main() {
     let mut pair_fitnesses = vec![0i32; POPULATION_SIZE / 2];
     let mut logits = vec![0i8; VOCAB_SIZE];
     let mut main_state = RecurrentState::default();
+    let mut update_buf = UpdateBuffers::new();
 
     for step in 0..max_steps {
         let step_seed = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32) ^ ((step as u32).wrapping_mul(0x9e3779b9));
@@ -434,14 +466,14 @@ fn main() {
 
         for l in 0..N_LAYERS {
             let l_seed = step_seed.wrapping_add((l as u32).wrapping_mul(100));
-            update_matrix(&mut model.gru_weights[l][0], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(1), &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.gru_weights[l][1], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(2), &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.gru_weights[l][2], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(3), &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.gru_weights[l][3], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(4), &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.mlp_weights[l][0], HIDDEN_DIM * 4, HIDDEN_DIM, l_seed.wrapping_add(5), &pair_fitnesses, POPULATION_SIZE);
-            update_matrix(&mut model.mlp_weights[l][1], HIDDEN_DIM, HIDDEN_DIM * 4, l_seed.wrapping_add(6), &pair_fitnesses, POPULATION_SIZE);
+            update_matrix_with_buf(&mut model.gru_weights[l][0], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(1), &pair_fitnesses, POPULATION_SIZE, &mut update_buf);
+            update_matrix_with_buf(&mut model.gru_weights[l][1], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(2), &pair_fitnesses, POPULATION_SIZE, &mut update_buf);
+            update_matrix_with_buf(&mut model.gru_weights[l][2], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(3), &pair_fitnesses, POPULATION_SIZE, &mut update_buf);
+            update_matrix_with_buf(&mut model.gru_weights[l][3], HIDDEN_DIM, HIDDEN_DIM, l_seed.wrapping_add(4), &pair_fitnesses, POPULATION_SIZE, &mut update_buf);
+            update_matrix_with_buf(&mut model.mlp_weights[l][0], HIDDEN_DIM * 4, HIDDEN_DIM, l_seed.wrapping_add(5), &pair_fitnesses, POPULATION_SIZE, &mut update_buf);
+            update_matrix_with_buf(&mut model.mlp_weights[l][1], HIDDEN_DIM, HIDDEN_DIM * 4, l_seed.wrapping_add(6), &pair_fitnesses, POPULATION_SIZE, &mut update_buf);
         }
-        update_matrix(&mut model.head, VOCAB_SIZE, HIDDEN_DIM, step_seed.wrapping_add(999), &pair_fitnesses, POPULATION_SIZE);
+        update_matrix_with_buf(&mut model.head, VOCAB_SIZE, HIDDEN_DIM, step_seed.wrapping_add(999), &pair_fitnesses, POPULATION_SIZE, &mut update_buf);
         total_tokens += SEQ_LEN;
     }
     println!("Training Done.");

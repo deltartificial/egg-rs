@@ -8,3 +8,5 @@ rayon = "1.10"
 
 [profile.release]
 strip = false
+debug = true
+opt-level = 3
