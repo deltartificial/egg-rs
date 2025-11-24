@@ -11,6 +11,15 @@ This project demonstrates integer-only training of a language model directly on 
 *   **Integer Only**: Operates entirely on `i8` weights/activations with `i32` accumulation. No float math in the training loop.
 *   **Gradient Free**: Uses Evolution Strategies (ES) with low-rank perturbations instead of backpropagation.
 
+## Benchmarks
+
+| Implementation | Avg Tok/s |
+|----------------|-----------|
+| Rust           | 11052.53  |
+| C              | 10221.27  |
+
+*Apple M4 Pro, 48 GB RAM, macOS 15.3*
+
 ## Quick Start
 
 ### 1. Prepare Data
@@ -36,6 +45,12 @@ const HIDDEN_DIM: usize = 128;
 const N_LAYERS: usize = 2;
 const SEQ_LEN: usize = 512;
 const POPULATION_SIZE: usize = 32;
+```
+
+## Benchmark
+
+```bash
+python3 bench/bench.py ./target/release/egg-rs
 ```
 
 ## References
